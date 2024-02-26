@@ -14,29 +14,34 @@ import java.util.function.Supplier;
 /**
  * An object which represents a document in Firebase
  */
-public interface FirestoreObject extends FirestoreDataObject {
-    String getDocumentReference();
-    MonoFirebase getFirebase();
-    void setFirebase(MonoFirebase firebase);
-
-    default Publisher<?> syncFromFirebase(final Map<String, Object> map) {
+public abstract class FirestoreObject implements FirestoreDataObject {
+    private MonoFirebase refDatabase;
+    public abstract String getDocumentReference();
+    public Publisher<?> syncFromFirebase(final Map<String, Object> map) {
         loadFromMap(map);
         return Mono.empty();
     }
 
-    default void create() {
-        getFirebase().createSink.emitNext(new CreateRequest(getDocumentReference(), this::getDataMap), (signalType, emitResult) -> signalType != SignalType.ON_ERROR);
+    public void create() {
+        if (refDatabase != null) {
+            refDatabase.createSink.emitNext(new CreateRequest(getDocumentReference(), this::getDataMap), (signalType, emitResult) -> signalType != SignalType.ON_ERROR);
+        }
     }
 
-    default void delete() {
-        getFirebase().deleteSink.emitNext(new DeleteRequest(getDocumentReference()), (signalType, emitResult) -> signalType != SignalType.ON_ERROR);
+    public void delete() {
+        if (refDatabase != null) {
+            refDatabase.deleteSink.emitNext(new DeleteRequest(getDocumentReference()), (signalType, emitResult) -> signalType != SignalType.ON_ERROR);
+        }
     }
 
-    default void updateField(final String field, final Supplier<Object> supplier) {
-        getFirebase().writeSink.emitNext(new WriteRequest(getDocumentReference(), field, supplier), (signalType, emitResult) -> signalType != SignalType.ON_ERROR);
+    public void updateField(final String field, final Supplier<Object> supplier) {
+        if (refDatabase != null) {
+            refDatabase.writeSink.emitNext(new WriteRequest(getDocumentReference(), field, supplier), (signalType, emitResult) -> signalType != SignalType.ON_ERROR);
+        }
     }
 
-    default void bind(final MonoFirebase firebase) {
+    public final void bind(final MonoFirebase firebase) {
+        this.refDatabase = firebase;
         firebase.registers.add(firebase.db.document(getDocumentReference()).addSnapshotListener((documentSnapshot, error) -> {
             if (documentSnapshot != null) {
                 firebase.syncSink.emitNext(new SyncRequest(this, documentSnapshot::getData), (signalType, emitResult) -> signalType != SignalType.ON_ERROR);
