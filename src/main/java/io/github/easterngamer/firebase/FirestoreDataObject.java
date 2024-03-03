@@ -82,8 +82,14 @@ public interface FirestoreDataObject {
     default long loadId(final String field, final Map<String, Object> dataMap) {
         final Object data = dataMap.get(field);
         if (data == null) {
-            throw new MissingValueException("String value not present for " + field + " in " + dataMap);
+            throw new MissingValueException("ID value not present for " + field + " in " + dataMap);
         }
-        return Long.parseLong((String) data);
+        if (data instanceof String stringifiedId) {
+            return Long.parseLong(stringifiedId);
+        } else if (data instanceof Number numberId) {
+            return numberId.longValue();
+        } else {
+            throw new MissingValueException("ID value not in correct format for " + field + " in " + dataMap);
+        }
     }
 }
