@@ -1,5 +1,6 @@
 package io.github.easterngamer.firebase;
 
+import com.google.firestore.v1.Value;
 import io.github.easterngamer.firebase.request.CreateRequest;
 import io.github.easterngamer.firebase.request.DeleteRequest;
 import io.github.easterngamer.firebase.request.SyncRequest;
@@ -14,10 +15,11 @@ import java.util.function.Supplier;
 /**
  * An object which represents a document in Firebase
  */
+@SuppressWarnings({"unused"})
 public abstract class FirestoreObject implements FirestoreDataObject {
     private MonoFirebase refDatabase;
     public abstract String getDocumentReference();
-    public Publisher<?> syncFromFirebase(final Map<String, Object> map) {
+    public Publisher<?> syncFromFirebase(final Map<String, Value> map) {
         loadFromMap(map);
         return Mono.empty();
     }
@@ -42,11 +44,13 @@ public abstract class FirestoreObject implements FirestoreDataObject {
 
     public final void bind(final MonoFirebase firebase) {
         this.refDatabase = firebase;
-        firebase.registers.add(firebase.db.document(getDocumentReference()).addSnapshotListener((documentSnapshot, error) -> {
-            if (documentSnapshot != null) {
-                firebase.syncSink.emitNext(new SyncRequest(this, documentSnapshot::getData), (signalType, emitResult) -> signalType != SignalType.ON_ERROR);
+        firebase.addListener(getDocumentReference(), (document) -> {
+            if (document != null) {
+                firebase.syncSink.emitNext(new SyncRequest(this, document::getFieldsMap), (signalType, emitResult) -> signalType != SignalType.ON_ERROR);
+            } else {
+                delete();
             }
-        }));
+        });
         firebase.cacheSinks.get(getDocumentReference()).emitValue(this, (signalType, emitResult) -> signalType != SignalType.ON_ERROR);
     }
 

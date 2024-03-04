@@ -1,26 +1,46 @@
 package io.github.easterngamer.firebase;
 
-import com.google.api.core.ApiFutureCallback;
 import com.google.api.core.ApiFutures;
-import com.google.api.gax.rpc.*;
+import com.google.api.gax.grpc.GrpcCallContext;
+import com.google.api.gax.rpc.ApiCallContext;
+import com.google.api.gax.rpc.ClientContext;
+import com.google.auth.oauth2.GoogleCredentials;
 import com.google.cloud.Timestamp;
+import com.google.cloud.firestore.WriteResult;
 import com.google.cloud.firestore.*;
+import com.google.cloud.firestore.spi.v1.FirestoreRpc;
+import com.google.cloud.firestore.v1.stub.GrpcFirestoreStub;
 import com.google.common.util.concurrent.MoreExecutors;
+import com.google.firestore.v1.*;
+import io.github.easterngamer.firebase.callbacks.DocumentListener;
+import io.github.easterngamer.firebase.callbacks.FirebaseCallback;
+import io.github.easterngamer.firebase.callbacks.FluxCallbackListener;
+import io.github.easterngamer.firebase.callbacks.MonoCallbackListener;
 import io.github.easterngamer.firebase.request.CreateRequest;
 import io.github.easterngamer.firebase.request.DeleteRequest;
 import io.github.easterngamer.firebase.request.SyncRequest;
 import io.github.easterngamer.firebase.request.WriteRequest;
+import io.grpc.ClientCall;
+import io.grpc.Metadata;
+import io.grpc.MethodDescriptor;
+import io.grpc.protobuf.ProtoUtils;
 import reactor.core.Disposable;
-import reactor.core.publisher.*;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
+import reactor.core.publisher.Sinks;
 import reactor.core.scheduler.Scheduler;
 import reactor.core.scheduler.Schedulers;
 import reactor.util.function.Tuple2;
 import reactor.util.function.Tuples;
 
+import java.io.IOException;
+import java.io.InputStream;
+import java.lang.reflect.Field;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Consumer;
 import java.util.function.Supplier;
 
 @SuppressWarnings({"unused", "unchecked"})
@@ -29,24 +49,46 @@ public class MonoFirebase {
     private static final Scheduler WRITE_SCHEDULER = Schedulers.newBoundedElastic(Runtime.getRuntime().availableProcessors()/2, Integer.MAX_VALUE, "Firebase-Write");
     private static final Scheduler READ_SCHEDULER = Schedulers.newBoundedElastic(Runtime.getRuntime().availableProcessors(), Integer.MAX_VALUE, "Firebase-Read");
     private static final Scheduler DELETE_SCHEDULER = Schedulers.newBoundedElastic(Runtime.getRuntime().availableProcessors()/2, Integer.MAX_VALUE, "Firebase-Delete");
-    private record FirebaseCallback<T>(MonoSink<T> sink) implements ApiFutureCallback<T> {
-        @Override
-        public void onFailure(Throwable t) {
-            sink.error(t);
-        }
 
-        @Override
-        public void onSuccess(T result) {
-            sink.success(result);
-        }
-    }
+    /**
+     * Taken from {@link GrpcFirestoreStub#getDocumentCallable()}
+     */
+    private static final MethodDescriptor<GetDocumentRequest, Document> GET_DOCUMENT = MethodDescriptor.<GetDocumentRequest, Document>newBuilder()
+            .setType(MethodDescriptor.MethodType.UNARY)
+            .setFullMethodName("google.firestore.v1.Firestore/GetDocument")
+            .setRequestMarshaller(ProtoUtils.marshaller(GetDocumentRequest.getDefaultInstance()))
+            .setResponseMarshaller(ProtoUtils.marshaller(Document.getDefaultInstance()))
+            .build();
+    /**
+     * Taken from {@link GrpcFirestoreStub#runQueryCallable()}
+     */
+    private static final MethodDescriptor<RunQueryRequest, RunQueryResponse> GET_DOCUMENTS =
+            MethodDescriptor.<RunQueryRequest, RunQueryResponse>newBuilder()
+                    .setType(MethodDescriptor.MethodType.SERVER_STREAMING)
+                    .setFullMethodName("google.firestore.v1.Firestore/RunQuery")
+                    .setRequestMarshaller(ProtoUtils.marshaller(RunQueryRequest.getDefaultInstance()))
+                    .setResponseMarshaller(ProtoUtils.marshaller(RunQueryResponse.getDefaultInstance()))
+                    .build();
+    /**
+     * Taken from {@link GrpcFirestoreStub#listenCallable()}
+     */
+    private static final MethodDescriptor<ListenRequest, ListenResponse> LISTEN_DOCUMENT =
+            MethodDescriptor.<ListenRequest, ListenResponse>newBuilder()
+                    .setType(MethodDescriptor.MethodType.BIDI_STREAMING)
+                    .setFullMethodName("google.firestore.v1.Firestore/Listen")
+                    .setRequestMarshaller(ProtoUtils.marshaller(ListenRequest.getDefaultInstance()))
+                    .setResponseMarshaller(ProtoUtils.marshaller(ListenResponse.getDefaultInstance()))
+                    .build();
+
     protected final Firestore db;
-
+    private final ApiCallContext context;
+    private final String documentPathPrefix;
+    private final String databasePathPrefix;
     protected final Sinks.Many<WriteRequest> writeSink;
     protected final Sinks.Many<CreateRequest> createSink;
     protected final Sinks.Many<DeleteRequest> deleteSink;
     protected final Sinks.Many<SyncRequest> syncSink;
-    protected final List<ListenerRegistration> registers;
+    protected final List<ClientCall<?,?>> registers;
     protected final Map<String, Sinks.One<FirestoreObject>> cacheSinks = Collections.synchronizedMap(new LinkedHashMap<>());
     public final Disposable createDisposable;
     private final Disposable writeDisposable;
@@ -55,14 +97,48 @@ public class MonoFirebase {
     private final Disposable batchDisposable;
     private final Map<String, Tuple2<SetOptions, Map<String, Object>>> batchQueue;
     private WriteBatch batch;
+    private static <RequestT, ResponseT> ClientCall<RequestT, ResponseT> newCall(final MethodDescriptor<RequestT, ResponseT> descriptor, final ApiCallContext context) {
+        final GrpcCallContext grpcContext = (GrpcCallContext) context;
+        return grpcContext.getChannel().newCall(descriptor, grpcContext.getCallOptions());
+    }
+    private static <T, K> T getField(final String fieldName, final K instance, final Class<T> cast) {
+        try {
+            final Field field = instance.getClass().getDeclaredField(fieldName);
+            field.setAccessible(true);
+            return cast.cast(field.get(instance));
+        } catch (IllegalAccessException | NoSuchFieldException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    /**
+     * Requires an input stream of the Google Credentials
+     * @throws IOException if there is an issue.
+     */
+    public MonoFirebase(InputStream googleCredentials) throws IOException {
+        this(FirestoreOptions.newBuilder().setCredentials(GoogleCredentials.fromStream(googleCredentials)).build());
+    }
 
     public MonoFirebase(final FirestoreOptions options) {
         this.db = options.getService();
+        {
+            this.context = getField(
+                    "clientContext",
+                    getField(
+                            "firestoreClient",
+                            db,
+                            FirestoreRpc.class
+                    ),
+                    ClientContext.class
+            ).getDefaultCallContext();
+            this.databasePathPrefix = "projects/" + options.getProjectId() + "/databases/" + options.getDatabaseId();
+            this.documentPathPrefix = "projects/" + options.getProjectId() + "/databases/" + options.getDatabaseId() + "/documents/";
+        }
         registers = Collections.synchronizedList(new ArrayList<>());
         createSink = Sinks.many().unicast().onBackpressureBuffer(new ArrayDeque<>(100));
         writeSink = Sinks.many().unicast().onBackpressureBuffer(new ArrayDeque<>(100));
         deleteSink = Sinks.many().unicast().onBackpressureBuffer(new ArrayDeque<>(100));
-        syncSink = Sinks.many().unicast().onBackpressureBuffer(new ArrayDeque<>(100), () -> registers.forEach(ListenerRegistration::remove));
+        syncSink = Sinks.many().unicast().onBackpressureBuffer(new ArrayDeque<>(100), () -> registers.forEach(call -> call.cancel(null, null)));
         this.createDisposable = createSink.asFlux()
                 .publishOn(WRITE_SCHEDULER)
                 .subscribeOn(WRITE_SCHEDULER)
@@ -126,8 +202,51 @@ public class MonoFirebase {
         }
     }
 
+    private static Map<String, Object> decodeMapValue(Map<String, Value> valueMap) {
+        Map<String, Object> outputMap = new HashMap<>();
+        for (Map.Entry<String, Value> entry : valueMap.entrySet()) {
+            outputMap.put(entry.getKey(), decodeValue(entry.getValue()));
+        }
+        return outputMap;
+    }
+
+    private static Object decodeValue(Value v) {
+        Value.ValueTypeCase typeCase = v.getValueTypeCase();
+        switch (typeCase) {
+            case NULL_VALUE:
+                return null;
+            case BOOLEAN_VALUE:
+                return v.getBooleanValue();
+            case INTEGER_VALUE:
+                return v.getIntegerValue();
+            case DOUBLE_VALUE:
+                return v.getDoubleValue();
+            case TIMESTAMP_VALUE:
+                return Timestamp.fromProto(v.getTimestampValue());
+            case STRING_VALUE:
+                return v.getStringValue();
+            case BYTES_VALUE:
+                return Blob.fromByteString(v.getBytesValue());
+            case GEO_POINT_VALUE:
+                return new GeoPoint(
+                        v.getGeoPointValue().getLatitude(), v.getGeoPointValue().getLongitude());
+            case ARRAY_VALUE:
+                List<Object> list = new ArrayList<>();
+                List<Value> lv = v.getArrayValue().getValuesList();
+                for (Value iv : lv) {
+                    list.add(decodeValue(iv));
+                }
+                return list;
+            case MAP_VALUE:
+                return decodeMapValue(v.getMapValue().getFieldsMap());
+            default:
+                throw FirestoreException.forInvalidArgument(
+                        String.format("Unknown Value Type: %s", typeCase));
+        }
+    }
+
     private Mono<WriteResult> createDocument(final CreateRequest request) {
-        return createDocument(request.documentPath(), request.dataSupplier().get());
+        return createDocument(request.documentPath(), decodeMapValue(request.dataSupplier().get()));
     }
 
     public Mono<WriteResult> createDocument(final String path, final Map<String, Object> map) {
@@ -146,41 +265,52 @@ public class MonoFirebase {
         return deleteDocument(path.documentReference());
     }
 
-    public Flux<DocumentSnapshot> listFromCollection(String collection) {
-        return Flux.<DocumentSnapshot>create(fluxSink -> db.collection(collection).stream(new ApiStreamObserver<>() {
-            @Override
-            public void onNext(DocumentSnapshot value) {
-                fluxSink.next(value);
-            }
-
-            @Override
-            public void onError(Throwable t) {
-                fluxSink.error(t);
-            }
-
-            @Override
-            public void onCompleted() {
-                fluxSink.complete();
-            }
-        })).publishOn(READ_SCHEDULER).subscribeOn(READ_SCHEDULER);
+    public Flux<Document> listFromCollection(String collection) {
+        return Flux.<RunQueryResponse>create(fluxSink -> {
+            final ClientCall<RunQueryRequest, RunQueryResponse> call = newCall(GET_DOCUMENTS, context);
+            fluxSink.onRequest(value -> call.request(value > Integer.MAX_VALUE ? Integer.MAX_VALUE : (int) value));
+            fluxSink.onCancel(() -> call.cancel(null, null));
+            call.start(new FluxCallbackListener<>(fluxSink), new Metadata());
+            call.request(1);
+            call.sendMessage(RunQueryRequest.newBuilder().setParent(documentPathPrefix + collection).build());
+        }).publishOn(READ_SCHEDULER).subscribeOn(READ_SCHEDULER).map(RunQueryResponse::getDocument);
+    }
+    public Mono<Document> getDocument(final String path) {
+        return Mono.<Document>create(sink -> {
+            ClientCall<GetDocumentRequest, Document> call = newCall(GET_DOCUMENT, context);
+            call.start(new MonoCallbackListener<>(sink), new Metadata());
+            call.request(1);
+            call.sendMessage(GetDocumentRequest.newBuilder().setName(documentPathPrefix + path).build());
+            sink.onCancel(() -> call.cancel(null, null));
+        }).publishOn(READ_SCHEDULER).subscribeOn(READ_SCHEDULER);
     }
 
-    public Mono<DocumentSnapshot> getDocument(final String path) {
-        return Mono.<DocumentSnapshot>create(sink -> ApiFutures.addCallback(db.document(path).get(), new FirebaseCallback<>(sink), MoreExecutors.directExecutor())).publishOn(READ_SCHEDULER).subscribeOn(READ_SCHEDULER);
+    public void addListener(final String document, final Consumer<Document> update) {
+        final ClientCall<ListenRequest, ListenResponse> call = newCall(LISTEN_DOCUMENT, context);
+        call.start(new DocumentListener(update), new Metadata());
+        call.request(Integer.MAX_VALUE);
+        call.sendMessage(ListenRequest.newBuilder()
+                .setDatabase(databasePathPrefix)
+                .setAddTarget(
+                        Target.newBuilder()
+                                .setDocuments(Target.DocumentsTarget.newBuilder()
+                                        .addDocuments(documentPathPrefix + document)
+                                        .build()
+                                ).build()
+                ).build()
+        );
+        registers.add(call);
     }
 
-    public static <T extends FirestoreObject> T load(final DocumentSnapshot snapshot, final Supplier<T> newObjectSupplier) {
-        if (snapshot.exists()) {
+    public static <T extends FirestoreObject> T load(final Document snapshot, final Supplier<T> newObjectSupplier) {
+        if (snapshot != null) {
+            final Map<String, Value> data = snapshot.getFieldsMap();
             final T obj = newObjectSupplier.get();
-            obj.loadFromMap(snapshot.getData());
+            obj.loadFromMap(data);
             return obj;
         } else {
             return null;
         }
-    }
-    public <T extends FirestoreObject> Flux<T> getObjects(final String collectionPath, final Supplier<? extends T> newObjectSupplier) {
-        return listFromCollection(collectionPath)
-                .mapNotNull(documentSnapshot -> load(documentSnapshot, newObjectSupplier));
     }
 
     public <T extends FirestoreObject> Mono<T> getObject(final String documentPath, final Supplier<T> newObjectSupplier) {
@@ -271,43 +401,52 @@ public class MonoFirebase {
         return size;
     }
 
-    private static int getSizeOfValue(Object object) {
-        int size = 0;
-        if (object instanceof List) {
-            List<Object> objects = (List<Object>) object;
-            final int objectsLength = objects.size();
-            for (int i = 0; i < objectsLength; i++) {
-                size += getSizeOfValue(objects.get(i));
+    private static int getSizeOfValue(Value object) {
+        switch (object.getValueTypeCase()) {
+            case STRING_VALUE -> {
+                return object.getStringValueBytes().size() + 1;
             }
-            return size;
-        } else if (object instanceof Map) {
-            return getSizeOfMap((Map<String, Object>) object);
-        } else if (object == null || object instanceof Boolean) {
-            return 1;
-        } else if (object instanceof String) {
-            return ((String) object).getBytes(StandardCharsets.UTF_8).length + 1;
-        } else if (object instanceof Timestamp) {
-            return 16;
-        } else if (object instanceof Blob) {
-            return ((Blob) object).toBytes().length;
-        } else if (object instanceof Double || object instanceof Integer) {
-            return 8;
-        } else if (object instanceof DocumentReference) {
-            return getPathSize(((DocumentReference) object).getPath());
-        } else if (object instanceof GeoPoint) {
-            return 16;
+            case INTEGER_VALUE, DOUBLE_VALUE -> {
+                return 8;
+            }
+            case BOOLEAN_VALUE, NULL_VALUE, VALUETYPE_NOT_SET -> {
+                return 1;
+            }
+            case ARRAY_VALUE -> {
+                int size = 0;
+                List<Value> objects = object.getArrayValue().getValuesList();
+                final int objectsLength = objects.size();
+                for (int i = 0; i < objectsLength; i++) {
+                    size += getSizeOfValue(objects.get(i));
+                }
+                return size;
+            }
+            case MAP_VALUE -> {
+                return getSizeOfMap(object.getMapValue().getFieldsMap());
+            }
+            case TIMESTAMP_VALUE, GEO_POINT_VALUE -> {
+                return 16;
+            }
+            case BYTES_VALUE -> {
+                return object.getBytesValue().size();
+            }
+            case REFERENCE_VALUE -> {
+                return getPathSize(object.getReferenceValue());
+            }
+            default -> {
+                return 0;
+            }
         }
-        return 0;
     }
-    private static int getSizeOfMap(final Map<String, Object> data) {
+    private static int getSizeOfMap(final Map<String, Value> data) {
         if (data == null) {
             return 0;
         }
-        List<Map.Entry<String, Object>> dataEntries = new ArrayList<>(data.entrySet());
+        List<Map.Entry<String, Value>> dataEntries = new ArrayList<>(data.entrySet());
         final int dataEntryListSize = dataEntries.size();
         int size = 0;
         for (int i = 0; i < dataEntryListSize; i++) {
-            Map.Entry<String, Object> entry = dataEntries.get(i);
+            Map.Entry<String, Value> entry = dataEntries.get(i);
             size += entry.getKey().getBytes(StandardCharsets.UTF_8).length + 1 + getSizeOfValue(entry.getValue());
         }
         return size;
@@ -316,15 +455,15 @@ public class MonoFirebase {
     public Mono<Integer> getDocumentSize(final String path) {
         final int pathSize = getPathSize(path);
         return getDocument(path)
-                .map(snapshot -> pathSize + getSizeOfMap(snapshot.getData()) + 32);
+                .map(snapshot -> pathSize + getSizeOfMap(snapshot.getFieldsMap()) + 32);
     }
-    public static int getDocumentSize(final String path, Map<String, Object> data) {
+    public static int getDocumentSize(final String path, Map<String, Value> data) {
         return getPathSize(path)
                 + getSizeOfMap(data) + 32;
     }
-    public static int getDocumentSize(final DocumentSnapshot documentSnapshot) {
-        return getPathSize(documentSnapshot.getReference().getPath())
-                + getSizeOfMap(documentSnapshot.getData()) + 32;
+    public static int getDocumentSize(final Document document) {
+        return getPathSize(document.getName())
+                + getSizeOfMap(document.getFieldsMap()) + 32;
     }
 
 }
