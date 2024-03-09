@@ -7,7 +7,7 @@ import org.reactivestreams.Publisher;
 import java.util.Map;
 import java.util.function.Supplier;
 
-public record SyncRequest(FirestoreObject object, Supplier<Map<String, Value>> dataSupplier) {
+public record MonoSyncRequest(FirestoreObject object, Supplier<Map<String, Value>> dataSupplier) {
     public Publisher<?> performSync() {
         return object.syncFromFirebase(dataSupplier.get());
     }

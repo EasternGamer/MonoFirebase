@@ -12,14 +12,16 @@ import com.google.cloud.firestore.spi.v1.FirestoreRpc;
 import com.google.cloud.firestore.v1.stub.GrpcFirestoreStub;
 import com.google.common.util.concurrent.MoreExecutors;
 import com.google.firestore.v1.*;
+import com.google.firestore.v1.Precondition;
+import com.google.protobuf.Descriptors;
 import io.github.easterngamer.firebase.callbacks.DocumentListener;
 import io.github.easterngamer.firebase.callbacks.FirebaseCallback;
 import io.github.easterngamer.firebase.callbacks.FluxCallbackListener;
 import io.github.easterngamer.firebase.callbacks.MonoCallbackListener;
-import io.github.easterngamer.firebase.request.CreateRequest;
-import io.github.easterngamer.firebase.request.DeleteRequest;
-import io.github.easterngamer.firebase.request.SyncRequest;
-import io.github.easterngamer.firebase.request.WriteRequest;
+import io.github.easterngamer.firebase.request.MonoCreateRequest;
+import io.github.easterngamer.firebase.request.MonoDeleteRequest;
+import io.github.easterngamer.firebase.request.MonoSyncRequest;
+import io.github.easterngamer.firebase.request.MonoWriteRequest;
 import io.grpc.ClientCall;
 import io.grpc.Metadata;
 import io.grpc.MethodDescriptor;
@@ -51,6 +53,28 @@ public class MonoFirebase {
     private static final Scheduler DELETE_SCHEDULER = Schedulers.newBoundedElastic(Runtime.getRuntime().availableProcessors()/2, Integer.MAX_VALUE, "Firebase-Delete");
 
     /**
+     * Taken from {@link GrpcFirestoreStub#writeCallable()}
+     */
+    private static final MethodDescriptor<com.google.firestore.v1.WriteRequest, WriteResponse> SINGLE_WRITE =
+            MethodDescriptor.<com.google.firestore.v1.WriteRequest, WriteResponse>newBuilder()
+                    .setType(MethodDescriptor.MethodType.BIDI_STREAMING)
+                    .setFullMethodName("google.firestore.v1.Firestore/Write")
+                    .setRequestMarshaller(ProtoUtils.marshaller(com.google.firestore.v1.WriteRequest.getDefaultInstance()))
+                    .setResponseMarshaller(ProtoUtils.marshaller(WriteResponse.getDefaultInstance()))
+                    .build();
+    /**
+     * Taken from {@link GrpcFirestoreStub#batchWriteCallable()}
+     */
+    private static final MethodDescriptor<BatchWriteRequest, BatchWriteResponse>
+            BATCH_WRITE =
+            MethodDescriptor.<BatchWriteRequest, BatchWriteResponse>newBuilder()
+                    .setType(MethodDescriptor.MethodType.UNARY)
+                    .setFullMethodName("google.firestore.v1.Firestore/BatchWrite")
+                    .setRequestMarshaller(ProtoUtils.marshaller(BatchWriteRequest.getDefaultInstance()))
+                    .setResponseMarshaller(ProtoUtils.marshaller(BatchWriteResponse.getDefaultInstance()))
+                    .build();
+
+    /**
      * Taken from {@link GrpcFirestoreStub#getDocumentCallable()}
      */
     private static final MethodDescriptor<GetDocumentRequest, Document> GET_DOCUMENT = MethodDescriptor.<GetDocumentRequest, Document>newBuilder()
@@ -79,15 +103,16 @@ public class MonoFirebase {
                     .setRequestMarshaller(ProtoUtils.marshaller(ListenRequest.getDefaultInstance()))
                     .setResponseMarshaller(ProtoUtils.marshaller(ListenResponse.getDefaultInstance()))
                     .build();
-
+    private static final Precondition NOT_EXISTS = Precondition.newBuilder().setExists(false).build();
+    private static final Precondition EXISTS = Precondition.newBuilder().setExists(false).build();
     protected final Firestore db;
     private final ApiCallContext context;
     private final String documentPathPrefix;
     private final String databasePathPrefix;
-    protected final Sinks.Many<WriteRequest> writeSink;
-    protected final Sinks.Many<CreateRequest> createSink;
-    protected final Sinks.Many<DeleteRequest> deleteSink;
-    protected final Sinks.Many<SyncRequest> syncSink;
+    protected final Sinks.Many<MonoWriteRequest> writeSink;
+    protected final Sinks.Many<MonoCreateRequest> createSink;
+    protected final Sinks.Many<MonoDeleteRequest> deleteSink;
+    protected final Sinks.Many<MonoSyncRequest> syncSink;
     protected final List<ClientCall<?,?>> registers;
     protected final Map<String, Sinks.One<FirestoreObject>> cacheSinks = Collections.synchronizedMap(new LinkedHashMap<>());
     public final Disposable createDisposable;
@@ -156,7 +181,7 @@ public class MonoFirebase {
         this.syncDisposable = syncSink.asFlux()
                 .publishOn(READ_SCHEDULER)
                 .subscribeOn(READ_SCHEDULER)
-                .flatMap(SyncRequest::performSync)
+                .flatMap(MonoSyncRequest::performSync)
                 .subscribe();
         this.batchQueue = new ConcurrentHashMap<>();
         this.batch = db.batch();
@@ -171,16 +196,19 @@ public class MonoFirebase {
                 })
                 .subscribe();
     }
+    // TODO: Fix for value inputs
     private static Mono<WriteResult> setDocument(final DocumentReference documentReference, final Map<String, Object> dataMap) {
         return Mono.<WriteResult>create(monoSink -> ApiFutures.addCallback(documentReference.set(dataMap, SetOptions.merge()), new FirebaseCallback<>(monoSink), MoreExecutors.directExecutor()))
                 .publishOn(WRITE_SCHEDULER).subscribeOn(WRITE_SCHEDULER);
     }
 
+    // TODO: Fix for value inputs
     public Mono<WriteResult> setDocument(final String documentReference, final Map<String, Object> dataMap) {
         return Mono.<WriteResult>create(monoSink -> ApiFutures.addCallback(db.document(documentReference).set(dataMap, SetOptions.merge()), new FirebaseCallback<>(monoSink), MoreExecutors.directExecutor()))
                 .publishOn(WRITE_SCHEDULER).subscribeOn(WRITE_SCHEDULER);
     }
 
+    // TODO: Fix for value inputs
     public void setDocument(final String path, final Map<String, Object> dataMap, final SetOptions options) {
         if (batchQueue.containsKey(path)) {
             Tuple2<SetOptions, Map<String, Object>> data = batchQueue.get(path);
@@ -192,7 +220,7 @@ public class MonoFirebase {
         }
     }
 
-    private void updateDocument(final WriteRequest request) {
+    private void updateDocument(final MonoWriteRequest request) {
         final String path = request.documentReference();
         if (batchQueue.containsKey(path)) {
             Tuple2<SetOptions, Map<String, Object>> data = batchQueue.get(path);
@@ -245,12 +273,23 @@ public class MonoFirebase {
         }
     }
 
-    private Mono<WriteResult> createDocument(final CreateRequest request) {
-        return createDocument(request.documentPath(), decodeMapValue(request.dataSupplier().get()));
+    private Mono<WriteResponse> createDocument(final MonoCreateRequest request) {
+        return createDocument(request.documentPath(), request.dataSupplier().get());
     }
 
-    public Mono<WriteResult> createDocument(final String path, final Map<String, Object> map) {
-        return Mono.<WriteResult>create(monoSink -> ApiFutures.addCallback(db.document(path).create(map), new FirebaseCallback<>(monoSink), MoreExecutors.directExecutor()))
+    public Mono<WriteResponse> createDocument(final String path, final Map<String, Value> map) {
+        return Mono.<WriteResponse>create(monoSink -> {
+                    final ClientCall<WriteRequest, WriteResponse> call = newCall(SINGLE_WRITE, context);
+                    call.start(new MonoCallbackListener<>(monoSink), null);
+                    call.sendMessage(WriteRequest.newBuilder().addWrites(
+                                    Write.newBuilder()
+                                            .setUpdate(Document.newBuilder().putAllFields(map).buildPartial())
+                                            .setCurrentDocument(NOT_EXISTS)
+                                            .build()
+                            ).build()
+                    );
+                    call.halfClose();
+                })
                 .publishOn(WRITE_SCHEDULER)
                 .subscribeOn(WRITE_SCHEDULER);
     }
@@ -261,7 +300,7 @@ public class MonoFirebase {
                 .subscribeOn(WRITE_SCHEDULER);
     }
 
-    public Mono<WriteResult> deleteDocument(final DeleteRequest path) {
+    public Mono<WriteResult> deleteDocument(final MonoDeleteRequest path) {
         return deleteDocument(path.documentReference());
     }
 

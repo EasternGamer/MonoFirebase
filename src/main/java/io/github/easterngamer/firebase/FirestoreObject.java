@@ -1,10 +1,10 @@
 package io.github.easterngamer.firebase;
 
 import com.google.firestore.v1.Value;
-import io.github.easterngamer.firebase.request.CreateRequest;
-import io.github.easterngamer.firebase.request.DeleteRequest;
-import io.github.easterngamer.firebase.request.SyncRequest;
-import io.github.easterngamer.firebase.request.WriteRequest;
+import io.github.easterngamer.firebase.request.MonoCreateRequest;
+import io.github.easterngamer.firebase.request.MonoDeleteRequest;
+import io.github.easterngamer.firebase.request.MonoSyncRequest;
+import io.github.easterngamer.firebase.request.MonoWriteRequest;
 import org.reactivestreams.Publisher;
 import reactor.core.publisher.Mono;
 import reactor.core.publisher.SignalType;
@@ -26,19 +26,19 @@ public abstract class FirestoreObject implements FirestoreDataObject {
 
     public void create() {
         if (refDatabase != null) {
-            refDatabase.createSink.emitNext(new CreateRequest(getDocumentReference(), this::getDataMap), (signalType, emitResult) -> signalType != SignalType.ON_ERROR);
+            refDatabase.createSink.emitNext(new MonoCreateRequest(getDocumentReference(), this::getDataMap), (signalType, emitResult) -> signalType != SignalType.ON_ERROR);
         }
     }
 
     public void delete() {
         if (refDatabase != null) {
-            refDatabase.deleteSink.emitNext(new DeleteRequest(getDocumentReference()), (signalType, emitResult) -> signalType != SignalType.ON_ERROR);
+            refDatabase.deleteSink.emitNext(new MonoDeleteRequest(getDocumentReference()), (signalType, emitResult) -> signalType != SignalType.ON_ERROR);
         }
     }
 
     public void updateField(final String field, final Supplier<Object> supplier) {
         if (refDatabase != null) {
-            refDatabase.writeSink.emitNext(new WriteRequest(getDocumentReference(), field, supplier), (signalType, emitResult) -> signalType != SignalType.ON_ERROR);
+            refDatabase.writeSink.emitNext(new MonoWriteRequest(getDocumentReference(), field, supplier), (signalType, emitResult) -> signalType != SignalType.ON_ERROR);
         }
     }
 
@@ -46,7 +46,7 @@ public abstract class FirestoreObject implements FirestoreDataObject {
         this.refDatabase = firebase;
         firebase.addListener(getDocumentReference(), (document) -> {
             if (document != null) {
-                firebase.syncSink.emitNext(new SyncRequest(this, document::getFieldsMap), (signalType, emitResult) -> signalType != SignalType.ON_ERROR);
+                firebase.syncSink.emitNext(new MonoSyncRequest(this, document::getFieldsMap), (signalType, emitResult) -> signalType != SignalType.ON_ERROR);
             } else {
                 delete();
             }
