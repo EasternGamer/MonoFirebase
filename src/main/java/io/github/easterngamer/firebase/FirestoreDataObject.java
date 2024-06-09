@@ -1,6 +1,8 @@
 package io.github.easterngamer.firebase;
 
+import com.google.firestore.v1.MapValue;
 import com.google.firestore.v1.Value;
+import com.google.protobuf.InvalidProtocolBufferException;
 
 import java.util.*;
 import java.util.function.Supplier;
@@ -10,8 +12,32 @@ import java.util.function.Supplier;
  */
 @SuppressWarnings({"unused"})
 public interface FirestoreDataObject {
+
     void loadFromMap(final Map<String, Value> map);
     Map<String, Value> getDataMap();
+
+    default void loadFromRaw(Map<String, byte[]> raw) {
+        final Map<String, Value> output = new HashMap<>();
+        raw.forEach((s, bytes) -> {
+            try {
+                output.put(s, Value.parseFrom(bytes));
+            } catch (InvalidProtocolBufferException e) {
+                throw new RuntimeException(e);
+            }
+        });
+        loadFromMap(output);
+    }
+
+    default Map<String, byte[]> toMappedRaw() {
+        final Map<String, byte[]> output = new HashMap<>();
+        getDataMap().forEach((s, value) -> output.put(s, value.toByteArray()));
+        return output;
+    }
+    default byte[] toRaw() {
+        MapValue.Builder builder = MapValue.newBuilder();
+        builder.putAllFields(getDataMap());
+        return builder.buildPartial().toByteArray();
+    }
 
     default <T extends FirestoreDataObject> List<T> getListOf(final Map<Long, T> objectMap) {
         final List<T> dataMap = new ArrayList<>();

@@ -11,9 +11,8 @@ import com.google.cloud.firestore.*;
 import com.google.cloud.firestore.spi.v1.FirestoreRpc;
 import com.google.cloud.firestore.v1.stub.GrpcFirestoreStub;
 import com.google.common.util.concurrent.MoreExecutors;
-import com.google.firestore.v1.*;
 import com.google.firestore.v1.Precondition;
-import com.google.protobuf.Descriptors;
+import com.google.firestore.v1.*;
 import io.github.easterngamer.firebase.callbacks.DocumentListener;
 import io.github.easterngamer.firebase.callbacks.FirebaseCallback;
 import io.github.easterngamer.firebase.callbacks.FluxCallbackListener;
@@ -105,6 +104,8 @@ public class MonoFirebase {
                     .build();
     private static final Precondition NOT_EXISTS = Precondition.newBuilder().setExists(false).build();
     private static final Precondition EXISTS = Precondition.newBuilder().setExists(false).build();
+    protected static final Map<FirestoreObject, MonoFirebase> REF_DATABASES = new HashMap<>();
+    protected static final Map<MonoFirebase, Set<FirestoreObject>> DATABASE_REF = new HashMap<>();
     protected final Firestore db;
     private final ApiCallContext context;
     private final String documentPathPrefix;
@@ -181,8 +182,7 @@ public class MonoFirebase {
         this.syncDisposable = syncSink.asFlux()
                 .publishOn(READ_SCHEDULER)
                 .subscribeOn(READ_SCHEDULER)
-                .flatMap(MonoSyncRequest::performSync)
-                .subscribe();
+                .subscribe(MonoSyncRequest::performSync);
         this.batchQueue = new ConcurrentHashMap<>();
         this.batch = db.batch();
 
@@ -381,6 +381,8 @@ public class MonoFirebase {
                 deleteDisposable.dispose();
                 syncDisposable.dispose();
                 batchDisposable.dispose();
+                DATABASE_REF.get(this).forEach(REF_DATABASES::remove);
+                DATABASE_REF.remove(this);
                 db.shutdown();
                 return true;
             } catch (Exception e) {
