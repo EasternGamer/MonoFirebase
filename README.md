@@ -20,7 +20,7 @@ import io.github.easterngamer.firebase.MapUtils;
 
 import java.util.Map;
 
-public class ExampleObject extends FirestoreObject {
+public class ExampleObject implements FirestoreObject {
     // Fields that might be in the document
     private long id;
     private String name;
@@ -110,11 +110,15 @@ import io.github.easterngamer.firebase.MapUtils;
 import java.util.Map;
 import java.util.List;
 
-public class ExampleObjectWithSub extends FirestoreObject {
+public class ExampleObjectWithSub implements FirestoreObject {
     private long id;
     private String name;
     private List<ExampleSubObject> subObjectList;
 
+    public List<ExampleSubObject> getSubObjectList() {
+        return subObjectList;
+    }
+    
     @Override
     public void loadFromMap(Map<String, Value> map) {
         this.id = loadId("id", map);
@@ -136,15 +140,28 @@ public class ExampleObjectWithSub extends FirestoreObject {
         return "testsub/" + id;
     }
 
-    public static class ExampleSubObject implements FirestoreDataObject {
+    public class ExampleSubObject implements FirestoreDataObject {
         private long id;
         private String subName;
+        
+        // Having this class as not static, it allows you to do this. Not a requirement.
+        public void setSubName(String subName) {
+            this.subName = subName;
+            updateSubObjectField("subs", Server.this::getSubObjectList);
+        }
+        
+        // If the class was static, this is an example of how you'd need to do it. (Or do it in the parent object)
+        public void setSubNameStatic(String subName, ExampleObjectWithSub object) {
+            this.subName = subName;
+            object.updateSubObjectField("subs", object::getSubObjectList);
+        }
+        
         @Override
         public void loadFromMap(Map<String, Value> map) {
             this.id = loadId("id", map);
             this.subName = loadString("sub", map);
         }
-
+        
         @Override
         public Map<String, Value> getDataMap() {
             return Map.ofEntries(
@@ -152,6 +169,27 @@ public class ExampleObjectWithSub extends FirestoreObject {
                     MapUtils.entry("sub", subName)
             );
         }
+    }
+}
+```
+#### Example Loading
+```java
+import com.google.cloud.firestore.FirestoreOptions;
+import io.github.easterngamer.firebase.MonoFirebase;
+import reactor.core.publisher.Mono;
+
+public class Main {
+    public static void main(String[] args) {
+        MonoFirebase monoFirebase = new MonoFirebase(FirestoreOptions.newBuilder().build()); // Replace with relevant settings
+        Mono<ExampleObjectWithSub> exampleObjectMono = monoFirebase.getObject("test/10", ExampleObjectWithSub::new); // loads the object
+        exampleObjectMono
+                .doOnNext(exampleObject -> {
+                    // A little ugly, but it allows us to make use of the actual object's document reference instead of passing it in as an argument.
+                    ExampleSubObject subObject = exampleObject.new ExampleSubObject();
+                    exampleObject.getSubObjectList().add(subObject);
+                    subObject.setSubName("sub"); // Queues updating exampleObjectWithSub's field
+                })
+                .subscribe(System.out::println); // Display
     }
 }
 ```
