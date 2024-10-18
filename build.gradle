@@ -4,15 +4,16 @@ plugins {
 }
 
 group = 'io.github.easterngamer'
-version = '1.4.3'
+version = '1.4.4'
 
 repositories {
     mavenCentral()
 }
 
 dependencies {
-    implementation 'io.projectreactor:reactor-core:3.6.6'
-    implementation 'com.google.cloud:google-cloud-firestore:3.21.3'
+    implementation 'io.projectreactor:reactor-core:3.6.8'
+    implementation 'io.projectreactor:reactor-tools:3.6.8'
+    implementation 'com.google.cloud:google-cloud-firestore:3.27.3'
 }
 publishing {
     repositories {
