@@ -11,9 +11,9 @@ repositories {
 }
 
 dependencies {
-    implementation 'io.projectreactor:reactor-core:3.6.8'
-    implementation 'io.projectreactor:reactor-tools:3.6.8'
-    implementation 'com.google.cloud:google-cloud-firestore:3.27.3'
+    implementation 'io.projectreactor:reactor-core:3.7.4'
+    implementation 'io.projectreactor:reactor-tools:3.7.4'
+    implementation 'com.google.cloud:google-cloud-firestore:3.30.11'
 }
 publishing {
     repositories {
